@@ -205,6 +205,12 @@
   .phone-row .src{color:var(--muted);font-size:12px}
   .phone-row .actions{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap}
   .phone-row .plates-list{width:100%;font-size:12px;color:var(--muted);margin-top:4px}
+  .phone-row.is-hit{background:var(--accent-soft)}
+  .phone-row .ct-name{font-weight:600}
+  .phone-row .ct-mail a{color:var(--accent);word-break:break-all}
+  .phone-row .share-warn{color:#b45309;font-weight:600}
+  .tel-summary{border-color:var(--accent)}
+  .tel-summary a{color:var(--accent);word-break:break-all}
   .manual-contact-box{display:flex;gap:8px;align-items:center;padding:10px;background:var(--card);border:1px dashed var(--border-strong);border-radius:8px;margin-top:12px;flex-wrap:wrap}
   .manual-contact-box input[type=text]{padding:8px 10px;border:1px solid var(--border-strong);border-radius:6px;background:var(--card);color:var(--text);font-size:13px;min-width:200px}
   .modal-overlay{position:fixed;inset:0;background:var(--overlay);display:flex;align-items:center;justify-content:center;z-index:2000;padding:20px}
@@ -460,10 +466,10 @@
       <div class="subview" id="gsub-buscar">
         <div class="card">
           <h3 style="margin-top:0">Buscar por placa o por número de contacto</h3>
-          <input aria-label="Escribe una placa o un número de teléfono..." type="text" class="global-search" id="dirSearchInput"
-                 placeholder="Escribe una placa o un número de teléfono..." />
+          <input aria-label="Filtra por placa, teléfono, nombre o correo" type="text" class="global-search" id="dirSearchInput"
+                 placeholder="Filtra por placa, teléfono, nombre de contacto o correo..." />
           <div id="dirSearchResults">
-            <div class="empty">Escribe una placa o un número de contacto para ver resultados.</div>
+            <div class="empty">Primero carga tus Excel en la pestaña Directorio.</div>
           </div>
         </div>
       </div>
@@ -1335,6 +1341,7 @@ function initSubtabs(){
       const el=document.getElementById('gsub-'+t.dataset.gsub);
       if(el)el.classList.add('active');
       if(t.dataset.gsub==='sincontacto')renderSinContacto();
+      if(t.dataset.gsub==='buscar')buscarEnDirectorio($('#dirSearchInput')?.value||'');
     });
   });
   // Base maestra
@@ -2329,7 +2336,7 @@ async function renderGestion(){
   if(!zone.dataset.bound){
     zone.dataset.bound='1';
     bindUpload(zone,$('#dirFileInput'),f=>manejarArchivoDirectorio(f),true);
-    $('#dirSearchInput').addEventListener('input',e=>buscarEnDirectorio(e.target.value));
+    $('#dirSearchInput').addEventListener('input',e=>buscarEnDirectorioDiferido(e.target.value));
     $('#scSearchInput').addEventListener('input',()=>renderSinContacto());
     $('#scExportExcelBtn').addEventListener('click',()=>exportarAExcel((state.gestion._scFiltradas||[]).map(r=>({Placa:r.placa,Chasis:r.chasis,Cliente:r.cliente,Archivo:r.archivo,Hoja:r.hoja})),'placas_sin_contacto.xlsx','Placas'));
     $('#scExportPdfBtn').addEventListener('click',()=>{
@@ -2357,9 +2364,10 @@ async function renderGestion(){
     }catch(e){console.warn('No se pudo leer el directorio guardado:',e);}
   }
   renderListaDirFiles();
+  buscarEnDirectorio($('#dirSearchInput')?.value||'');
 }
 
-const DIR_KW=['placa','nombre','identificador','observ','tel','cel','contact','cliente','chasis','poliza','asegurado','vin','marca','modelo','estado','fecha'];
+const DIR_KW=['placa','nombre','identificador','observ','comentario','tel','cel','contact','correo','email','cliente','chasis','poliza','asegurado','vin','marca','modelo','estado','fecha'];
 const alnum=s=>String(s??'').toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^A-Z0-9]/g,'');
 const esHojaQualitas=n=>normKey(n).includes('qualitas');
 
@@ -2379,6 +2387,28 @@ function detectarHeaderDir(matrix){
 }
 
 // Lee TODAS las hojas del libro (el directorio no debe quedarse solo con la primera)
+// Copia los comentarios/notas de celda del Excel a una columna "Comentarios notas" de su fila
+// (sin "cel"/"tel" en el nombre para que no se confunda con una columna de teléfono)
+function agregarComentariosCelda(ws,matrix,hdr){
+  if(!ws||!ws['!ref'])return;
+  const r0=XLSX.utils.decode_range(ws['!ref']).s.r;
+  const porFila=new Map();
+  Object.keys(ws).forEach(k=>{
+    if(k[0]==='!')return;
+    const cell=ws[k];
+    if(!cell||!Array.isArray(cell.c)||!cell.c.length)return;
+    const fi=XLSX.utils.decode_cell(k).r-r0;
+    if(fi<=hdr)return;
+    const txt=cell.c.map(x=>String(x.t??'').trim()).filter(Boolean).join('\n');
+    if(txt)porFila.set(fi,(porFila.has(fi)?porFila.get(fi)+'\n':'')+txt);
+  });
+  if(!porFila.size)return;
+  const ncol=matrix.reduce((m,r)=>Math.max(m,(r||[]).length),0);
+  if(!matrix[hdr])matrix[hdr]=[];
+  matrix[hdr][ncol]='Comentarios notas';
+  porFila.forEach((t,fi)=>{if(!matrix[fi])matrix[fi]=[];matrix[fi][ncol]=t;});
+}
+
 async function leerLibroCompleto(file){
   if(!/\.(xlsx|xls)$/i.test(file.name))throw new Error('Formato no válido. Usa .xlsx o .xls');
   if(typeof XLSX==='undefined')throw new Error('No se cargó la librería XLSX. Revisa tu conexión a internet y recarga la página.');
@@ -2391,22 +2421,116 @@ async function leerLibroCompleto(file){
   const wb=XLSX.read(new Uint8Array(buf),{type:'array',cellDates:true});
   const sheets=[];
   wb.SheetNames.forEach(nombre=>{
-    const matrix=XLSX.utils.sheet_to_json(wb.Sheets[nombre],{header:1,defval:'',raw:false,dateNF:'dd/mm/yyyy'});
+    const ws=wb.Sheets[nombre];
+    const matrix=XLSX.utils.sheet_to_json(ws,{header:1,defval:'',raw:false,dateNF:'dd/mm/yyyy',blankrows:true});
     if(!matrix.length)return;
-    const{headers,rows}=matrizAObjetos(matrix,detectarHeaderDir(matrix));
+    const hdr=detectarHeaderDir(matrix);
+    agregarComentariosCelda(ws,matrix,hdr);
+    const{headers,rows}=matrizAObjetos(matrix,hdr);
     if(!headers.length||!rows.length)return;
     sheets.push({nombre,headers,rows,esQualitas:esHojaQualitas(nombre)});
   });
   return sheets;
 }
 
+const RX_TEL=/(?:\+?\d{1,3}[\s.-]?)?(?:\d[\s.-]?){6,11}\d/g;
+const RX_EMAIL=/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}/g;
+const RX_FECHA=/\b\d{1,4}[\/-]\d{1,2}[\/-]\d{1,4}\b/g;
+const blanquear=m=>' '.repeat(m.length);
+function normTel(m){
+  let d=String(m).replace(/\D/g,'');
+  if(d.length===11&&d.startsWith('51'))d=d.slice(2);   // quita prefijo Perú
+  return d.length>=7&&d.length<=11?d:'';
+}
 function extraerTelefonos(texto){
-  const t=String(texto??'').replace(/\b\d{1,4}[\/-]\d{1,2}[\/-]\d{1,4}\b/g,' ');   // quita fechas
+  const t=String(texto??'').replace(RX_EMAIL,blanquear).replace(RX_FECHA,blanquear);
   const out=[];
-  (t.match(/(?:\+?\d{1,3}[\s.-]?)?(?:\d[\s.-]?){6,11}\d/g)||[]).forEach(m=>{
-    let d=m.replace(/\D/g,'');
-    if(d.length===11&&d.startsWith('51'))d=d.slice(2);   // quita prefijo Perú
-    if(d.length>=7&&d.length<=11&&!out.includes(d))out.push(d);
+  (t.match(RX_TEL)||[]).forEach(m=>{const d=normTel(m);if(d&&!out.includes(d))out.push(d);});
+  return out;
+}
+
+// Palabras que nunca forman parte de un nombre de contacto
+const NO_NOMBRE=new Set(('a al el la lo los las un una uno unos unas de del y e o u en con sin por para se su sus le les me mi que q no si es son fue ser '+
+  'esta este estos estas ese esa eso hay ha han he ya mas pero tambien solo muy otro otra otros nuevo nueva mismo misma '+
+  'numero num nro no. n tel telf telef telefono telefonos fono cel celular celulares movil whatsapp wsp wasap fijo anexo '+
+  'correo email mail e-mail contacto contactos contactar contactarse cliente clientes nombre nombres dato datos '+
+  'sr sra srta sres sras senor senora senorita don dona ing lic dr dra '+
+  'llamar llamada llamadas llame llamo llamo. llamando marcar marco comunica comunico comunicar comunicarse comunicacion '+
+  'indica indico refiere refirio senala senalo manifiesta manifesto dice dijo menciona menciono informa informo comenta comento '+
+  'responde respondio contesta contesto atiende atendio confirma confirmo solicita solicito pide pidio '+
+  'obs observacion observaciones comentario comentarios nota notas gps unidad unidades placa placas vehiculo vehiculos '+
+  'equipo equipos ghost gosth desgase desgases senal apagado apagada buzon fuera servicio respuesta '+
+  'actualizar actualizado actualizada actualizacion fecha hora hoy ayer manana tarde noche am pm hrs hr ok '+
+  'enviar envio enviado enviada mensaje whatsapp sms reporte reporto revisar revision cita taller '+
+  'jefe encargado encargada responsable chofer conductor propietario propietaria titular dueno duena '+
+  'gerente asistente supervisor operador operaciones flota empresa area oficina central').split(/\s+/));
+const RX_KW_NOMBRE=/\b(?:sr|sra|srta|senor|senora|senorita|don|dona|ing|lic|dr|dra|contacto|nombre|encargad[oa]|responsable|chofer|conductor|propietari[oa]|titular|duen[oa]|jefe|gerente|asistente|supervisor|operador|atendio|atiende|hablo con|hablar con|comunico con|preguntar por)\b/g;
+// minúsculas y sin tildes, conservando la posición de cada letra
+const sinTildes=s=>String(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+const RX_TOKEN=/[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+|[^\sA-Za-zÁÉÍÓÚÜÑáéíóúüñ]+/g;
+const esPalabra=t=>/^[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+$/.test(t);
+const esNombre=t=>esPalabra(t)&&t.length>=2&&!NO_NOMBRE.has(normKey(t));
+const titulo=ws=>ws.map(w=>w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()).join(' ');
+
+// Grupos de palabras seguidas que parecen nombre (se cortan con números, signos o palabras comunes)
+function corridasNombre(txt){
+  const runs=[];let cur=[];
+  (txt.match(RX_TOKEN)||[]).forEach(t=>{
+    if(esNombre(t))cur.push(t);
+    else{if(cur.length)runs.push(cur);cur=[];}
+  });
+  if(cur.length)runs.push(cur);
+  return runs;
+}
+// Nombre después de "Sr.", "contacto:", "encargado", etc.
+function nombrePorPalabraClave(txt){
+  let res='';
+  for(const m of sinTildes(txt).matchAll(RX_KW_NOMBRE)){
+    const resto=txt.slice(m.index+m[0].length).replace(/^[\s.:\-–,]+/,'');
+    const run=corridasNombre(resto.split(/[\d,;:()\/]/)[0])[0];
+    if(run&&resto.match(RX_TOKEN)&&esNombre(resto.match(RX_TOKEN)[0]))res=titulo(run.slice(0,4));
+  }
+  return res;
+}
+function nombreAntes(txt){
+  const k=nombrePorPalabraClave(txt);
+  if(k)return k;
+  const runs=corridasNombre(txt);
+  const r=runs[runs.length-1];
+  return r&&r.length>=2?titulo(r.slice(-4)):'';
+}
+function nombreDespues(txt){
+  // Solo si el nombre va pegado al número: "987654321 - Juan Pérez" / "987654321 (Juan Pérez)"
+  const m=txt.match(/^[\s\-–:(]*([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ\s]*)/);
+  if(!m)return '';
+  const run=corridasNombre(m[1])[0];
+  return run&&run.length>=2&&esNombre(m[1].trim().split(/\s+/)[0])?titulo(run.slice(0,4)):'';
+}
+
+// Extrae contactos {tel,nombre,correo} de un texto libre (observaciones, comentarios, celdas de contacto)
+function extraerContactos(texto){
+  const out=[];
+  String(texto??'').split(/[\n\r;|]+/).forEach(clausula=>{
+    const correos=[];
+    for(const m of clausula.matchAll(RX_EMAIL))correos.push({c:m[0].toLowerCase(),i:m.index});
+    const limpio=clausula.replace(RX_EMAIL,blanquear).replace(RX_FECHA,blanquear);
+    const tels=[];
+    for(const m of limpio.matchAll(RX_TEL)){const d=normTel(m[0]);if(d)tels.push({d,i:m.index,f:m.index+m[0].length});}
+    tels.forEach((t,j)=>{
+      const ini=j?tels[j-1].f:0;
+      const fin=j<tels.length-1?tels[j+1].i:limpio.length;
+      const nombre=nombreAntes(limpio.slice(ini,t.i))||nombreDespues(limpio.slice(t.f,fin));
+      out.push({tel:t.d,nombre,correo:''});
+    });
+    // cada correo va con el teléfono más cercano de la misma frase
+    correos.forEach(e=>{
+      if(tels.length){
+        let mej=0;tels.forEach((t,j)=>{if(Math.abs(t.i-e.i)<Math.abs(tels[mej].i-e.i))mej=j;});
+        const c=out[out.length-tels.length+mej];
+        if(!c.correo){c.correo=e.c;return;}
+      }
+      out.push({tel:'',nombre:nombrePorPalabraClave(limpio)||nombreAntes(limpio.slice(0,e.i)),correo:e.c});
+    });
   });
   return out;
 }
@@ -2421,6 +2545,7 @@ function indexarArchivoDir(f){
     const cPlaca=idx(k=>k.includes('placa'));
     const cTel=idx(k=>/(tel|cel|movil|whats|fono)/.test(k));
     const cCont=idx(k=>k.includes('contact'));
+    const cMail=idx(k=>/(correo|e-?mail|\bmail)/.test(k));
     const cObs=idx(k=>/(observ|nota|comentario)/.test(k));
     const cChasis=idx(k=>/(chasis|vin|serie)/.test(k));
     const cIdent=idx(k=>k.includes('identificador'));
@@ -2429,25 +2554,53 @@ function indexarArchivoDir(f){
     sh.rows.forEach(r=>{
       const vals=hs.map(h=>String(r[h]??''));
       const g=ix=>ix.map(i=>vals[i].trim()).filter(Boolean);
-      const telsCol=[],telsObs=[];
-      g(cTel).concat(g(cCont)).forEach(v=>extraerTelefonos(v).forEach(t=>{if(!telsCol.includes(t))telsCol.push(t);}));
+      const contactos=[];
+      const agregar=(c,via)=>{
+        const ya=contactos.find(x=>(c.tel&&x.tel===c.tel)||(!c.tel&&c.correo&&x.correo===c.correo));
+        if(ya){if(!ya.nombre)ya.nombre=c.nombre;if(!ya.correo)ya.correo=c.correo;return;}
+        contactos.push({tel:c.tel,nombre:c.nombre,correo:c.correo,via});
+      };
+      // 1) Columnas de teléfono / contacto / correo
+      Array.from(new Set(cTel.concat(cCont,cMail))).forEach(i=>{const v=vals[i].trim();if(v)extraerContactos(v).forEach(c=>agregar(c,'contacto'));});
+      const nombreContacto=g(cCont).find(v=>extraerTelefonos(v).length===0&&!v.includes('@'))||'';
+      const correoCol=(g(cMail).join(' ').match(RX_EMAIL)||[])[0]||'';
+      contactos.forEach(c=>{
+        if(!c.nombre&&nombreContacto)c.nombre=titulo(nombreContacto.split(/\s+/));
+        if(c.tel&&!c.correo&&correoCol)c.correo=correoCol.toLowerCase();
+      });
+      // 2) Observaciones / comentarios (incluye los comentarios de celda del Excel)
       const obs=g(cObs).join('\n');
-      extraerTelefonos(obs).forEach(t=>{if(!telsCol.includes(t)&&!telsObs.includes(t))telsObs.push(t);});
+      extraerContactos(obs).forEach(c=>{
+        // nombre/correo sin teléfono en la observación: completa el teléfono de la fila que no lo tenga
+        if(!c.tel){
+          const x=contactos.find(x=>x.tel&&!x.correo&&(!x.nombre||!c.nombre||x.nombre===c.nombre));
+          if(x){if(!x.nombre)x.nombre=c.nombre;x.correo=c.correo;return;}
+        }
+        agregar(c,'observaciones');
+      });
+      // quita correos sueltos que ya quedaron unidos a un teléfono
+      const conTel=new Set(contactos.filter(c=>c.tel&&c.correo).map(c=>c.correo));
+      const lista=contactos.filter(c=>c.tel||!conTel.has(c.correo));
+      const telsCol=lista.filter(c=>c.tel&&c.via==='contacto').map(c=>c.tel);
+      const telsObs=lista.filter(c=>c.tel&&c.via==='observaciones').map(c=>c.tel);
       const placa=g(cPlaca)[0]||g(cNombre)[0]||g(cIdent)[0]||'';
       let chasis=g(cChasis)[0]||'';
       if(!chasis){const id=(g(cIdent)[0]||'').replace(/_/g,'');if(id&&alnum(id)!==alnum(placa))chasis=id;}
-      const nombreContacto=g(cCont).find(v=>extraerTelefonos(v).length===0)||'';
       const cliente=g(cCliente)[0]||(cPlaca.length?g(cNombre)[0]:'')||nombreContacto||'';
       const claves=Array.from(new Set([placa,chasis].concat(g(cPlaca),g(cIdent),g(cChasis)).map(alnum).filter(a=>a.length>=5)));
-      f._recs.push({f,sh,vals,placa,chasis,cliente,obs,telsCol,telsObs,claves,a:vals.map(alnum)});
+      f._recs.push({f,sh,vals,placa,chasis,cliente,obs,contactos:lista,telsCol,telsObs,claves,a:vals.map(alnum)});
     });
   });
 }
 
 // clave (placa/chasis/identificador) -> Map(teléfono -> [{fuente,qualitas,via}])
+// y agrupación por placa con todos sus contactos (nombre, correo, teléfono)
 function reconstruirIndiceDir(){
   const ind=new Map();
-  state.gestion.dirFiles.forEach(f=>f._recs.forEach(rec=>{
+  const recsPorClave=new Map();
+  const recs=todosLosRecs();
+  recs.forEach(rec=>{
+    rec.claves.forEach(c=>{if(!recsPorClave.has(c))recsPorClave.set(c,[]);recsPorClave.get(c).push(rec);});
     const items=rec.telsCol.map(t=>({t,via:'contacto'})).concat(rec.telsObs.map(t=>({t,via:'observaciones'})));
     if(!items.length)return;
     const fuente=`${rec.f.archivo.nombre} › ${rec.sh.nombre}`;
@@ -2459,8 +2612,44 @@ function reconstruirIndiceDir(){
         m.get(t).push({fuente,qualitas:rec.sh.esQualitas,via});
       });
     });
-  }));
+  });
   state.gestion.indice=ind;
+
+  const grupos=new Map();
+  recs.forEach(rec=>{
+    const key=alnum(rec.placa)||rec.claves[0];
+    if(!key)return;
+    if(!grupos.has(key))grupos.set(key,{key,placa:rec.placa,cliente:'',claves:new Set(),qualitas:false,recs:new Set()});
+    const g=grupos.get(key);
+    rec.claves.forEach(c=>g.claves.add(c));
+    g.recs.add(rec);
+    if(rec.sh.esQualitas){g.qualitas=true;if(rec.cliente)g.cliente=rec.cliente;if(rec.placa)g.placa=rec.placa;}
+    else if(!g.cliente&&rec.cliente)g.cliente=rec.cliente;
+  });
+  const porTel=new Map();   // teléfono -> Set(key de placa)
+  grupos.forEach(g=>{
+    // registros de otros archivos/hojas enlazados por placa, chasis o identificador
+    g.claves.forEach(c=>(recsPorClave.get(c)||[]).forEach(r=>g.recs.add(r)));
+    const cts=new Map();
+    g.recs.forEach(rec=>rec.contactos.forEach(c=>{
+      const k=c.tel||c.correo;
+      if(!cts.has(k))cts.set(k,{tel:c.tel,nombres:new Set(),correos:new Set(),vias:new Set(),fuentes:new Set(),qualitas:false});
+      const e=cts.get(k);
+      if(c.nombre)e.nombres.add(c.nombre);
+      if(c.correo)e.correos.add(c.correo);
+      e.vias.add(c.via);
+      e.fuentes.add(`${rec.f.archivo.nombre} › ${rec.sh.nombre}`);
+      if(rec.sh.esQualitas)e.qualitas=true;
+    }));
+    g.contactos=Array.from(cts.values()).sort((a,b)=>(b.qualitas-a.qualitas)||(!!b.tel-!!a.tel)||(b.vias.has('contacto')-a.vias.has('contacto')));
+    g.contactos.forEach(c=>{if(c.tel){if(!porTel.has(c.tel))porTel.set(c.tel,new Set());porTel.get(c.tel).add(g.key);}});
+    g.txt=normKey([g.placa,g.cliente].concat(...g.contactos.map(c=>[...c.nombres,...c.correos])).join(' | '));
+    delete g.recs;
+    g.claves=Array.from(g.claves);
+  });
+  state.gestion.grupos=Array.from(grupos.values()).sort((a,b)=>(b.qualitas-a.qualitas)||(b.contactos.length>0)-(a.contactos.length>0)||String(a.placa).localeCompare(String(b.placa)));
+  state.gestion.grupoPorKey=grupos;
+  state.gestion.porTel=porTel;
 }
 function todosLosRecs(){return state.gestion.dirFiles.flatMap(f=>f._recs||[]);}
 
@@ -2479,7 +2668,7 @@ async function manejarArchivoDirectorio(file){
     try{await idbPut(STORES.PREFS,{clave:'dir_file:'+archivo.nombre,valor:{archivo,sheets}});}
     catch(e){console.warn('No se pudo guardar el archivo en el navegador:',e);}
     renderListaDirFiles();
-    const q=$('#dirSearchInput');if(q&&q.value)buscarEnDirectorio(q.value);
+    buscarEnDirectorio($('#dirSearchInput')?.value||'');
     const hq=sheets.some(sh=>sh.esQualitas);
     toast(`✔ ${file.name}: ${archivo.total} registros en ${sheets.length} hoja(s)`+(hq?' (incluye Qualitas)':' — sin hoja Qualitas'),hq?'ok':'info',3500);
   }catch(err){
@@ -2514,99 +2703,89 @@ function renderListaDirFiles(){
       try{if(f)await idbDelete(STORES.PREFS,'dir_file:'+f.archivo.nombre);}catch(e){console.warn(e);}
       reconstruirIndiceDir();
       renderListaDirFiles();
-      const q=$('#dirSearchInput');if(q&&q.value)buscarEnDirectorio(q.value);
+      buscarEnDirectorio($('#dirSearchInput')?.value||'');
     });
   });
 }
 
+let _dirSearchTimer=null;
+function buscarEnDirectorioDiferido(q){
+  clearTimeout(_dirSearchTimer);
+  _dirSearchTimer=setTimeout(()=>buscarEnDirectorio(q),150);
+}
+
+// Listado de placas con sus contactos. Sin texto muestra todo; al escribir filtra por
+// placa, chasis, cliente, nombre de contacto, correo o teléfono.
 function buscarEnDirectorio(q){
   const cont=$('#dirSearchResults');
   if(!cont)return;
-  const msg=t=>{cont.innerHTML=`<div class="empty">${t}</div>`;};
+  const grupos=state.gestion.grupos||[];
+  if(!grupos.length){cont.innerHTML='<div class="empty">Primero carga tus Excel en la pestaña Directorio.</div>';return;}
+
   const raw=String(q??'').trim();
-  if(!raw){msg('Escribe una placa o un número de teléfono para ver resultados.');return;}
-  const recs=todosLosRecs();
-  if(!recs.length){msg('Primero carga tus Excel en la pestaña Directorio.');return;}
-
-  // ¿Teléfono o placa? Solo dígitos (con espacios, guiones o +51) = teléfono
-  const soloDig=raw.replace(/[\s.\-+()]/g,'');
-  const esTel=/^\d+$/.test(soloDig);
-  if(esTel){
-    let d=soloDig;
-    if(d.length===11&&d.startsWith('51'))d=d.slice(2);
-    if(d.length<6){msg('Escribe al menos 6 dígitos del teléfono (o una placa).');return;}
-    return buscarPorTelefono(cont,d,recs);
+  let lista=grupos,telQ='';
+  if(raw){
+    const ql=normKey(raw),qa=alnum(raw);
+    let dig=raw.replace(/[\s.\-+()]/g,'');
+    const esTel=/^\d+$/.test(dig);
+    if(esTel&&dig.length===11&&dig.startsWith('51'))dig=dig.slice(2);
+    if(esTel&&dig.length>=3)telQ=dig;
+    lista=grupos.filter(g=>
+      (qa&&(alnum(g.placa).includes(qa)||g.claves.some(c=>c.includes(qa))))||
+      g.txt.includes(ql)||
+      (telQ&&g.contactos.some(c=>c.tel.includes(telQ))));
   }
-  const qa=alnum(raw);
-  if(qa.length<3){msg('Escribe al menos 3 caracteres de la placa.');return;}
-  buscarPorPlaca(cont,qa,recs);
+  if(!lista.length){cont.innerHTML='<div class="empty">Sin resultados para esa búsqueda.</div>';return;}
+
+  const LIM=100;
+  let html=resumenTelefonoHtml(telQ);
+  html+=`<div class="counter">${raw?`${lista.length} placa(s) encontrada(s)`:`${lista.length} placa(s) en el directorio`}${lista.length>LIM?` — mostrando ${LIM}, escribe para filtrar`:''}</div>`;
+  html+=lista.slice(0,LIM).map(g=>tarjetaPlacaHtml(g,telQ)).join('');
+  cont.innerHTML=html;
 }
 
-function filaTelefonoHtml(tel,qualitas,detalle){
-  return `<div class="phone-row${qualitas?' is-primary':''}"><span class="phone">${esc(tel)}</span>${qualitas?'<span class="badge-star">QUALITAS</span>':''}<span class="src">${esc(detalle)}</span><span class="actions"><a class="btn small" href="tel:${esc(tel)}">Llamar</a></span></div>`;
-}
-
-// PLACA -> solo sus teléfonos (como contacto o en observaciones, en cualquier archivo/hoja)
-function buscarPorPlaca(cont,qa,recs){
-  const ind=state.gestion.indice||new Map();
-  const grupos=new Map();   // placa normalizada -> datos
-  recs.forEach(rec=>{
-    const ok=rec.placa&&(alnum(rec.placa).includes(qa)||rec.claves.some(c=>c.includes(qa)));
-    if(!ok)return;
-    const key=alnum(rec.placa)||rec.claves[0];
-    if(!grupos.has(key))grupos.set(key,{placa:rec.placa,cliente:'',claves:new Set(),qualitas:false});
-    const g=grupos.get(key);
-    rec.claves.forEach(c=>g.claves.add(c));
-    if(rec.sh.esQualitas){g.qualitas=true;if(rec.cliente)g.cliente=rec.cliente;g.placa=rec.placa;}
-    else if(!g.cliente&&rec.cliente)g.cliente=rec.cliente;
-  });
-  if(!grupos.size){cont.innerHTML='<div class="empty">No se encontró esa placa en ninguno de los archivos cargados.</div>';return;}
-
-  const lista=Array.from(grupos.values()).sort((a,b)=>(b.qualitas-a.qualitas)||a.placa.localeCompare(b.placa));
-  let html=`<div class="counter">${lista.length} placa(s) encontrada(s)${lista.length>50?' — mostrando 50':''}</div>`;
-  html+=lista.slice(0,50).map(g=>{
-    const tels=new Map();   // tel -> {qualitas,vias,fuentes}
-    g.claves.forEach(c=>{
-      const m=ind.get(c);if(!m)return;
-      m.forEach((arr,t)=>{
-        if(!tels.has(t))tels.set(t,{qualitas:false,vias:new Set(),fuentes:new Set()});
-        const e=tels.get(t);
-        arr.forEach(x=>{if(x.qualitas)e.qualitas=true;e.vias.add(x.via);e.fuentes.add(x.fuente);});
-      });
-    });
-    const filas=Array.from(tels.entries()).sort((a,b)=>b[1].qualitas-a[1].qualitas).map(([t,e])=>
-      filaTelefonoHtml(t,e.qualitas,`${Array.from(e.vias).join(' + ')} · ${Array.from(e.fuentes).join(' · ')}`)).join('');
-    return `<div class="contact-result">
-      <div class="field"><b style="font-size:15px;">${esc(g.placa)}</b>${g.cliente?`<span class="src" style="color:var(--muted);">${esc(g.cliente)}</span>`:''}</div>
-      ${filas?`<div class="phones">${filas}</div>`:'<div class="field" style="color:var(--muted);">Sin teléfono asociado.</div>'}
+// Si se busca un teléfono completo: quiénes lo usan y en cuántas placas
+function resumenTelefonoHtml(telQ){
+  if(!telQ||telQ.length<6)return '';
+  const porTel=state.gestion.porTel||new Map();
+  const porKey=state.gestion.grupoPorKey||new Map();
+  const tels=Array.from(porTel.keys()).filter(t=>t.includes(telQ));
+  if(!tels.length||tels.length>5)return '';
+  return tels.map(t=>{
+    const keys=Array.from(porTel.get(t));
+    const nombres=new Set(),correos=new Set();
+    keys.forEach(k=>(porKey.get(k)?.contactos||[]).forEach(c=>{if(c.tel===t){c.nombres.forEach(n=>nombres.add(n));c.correos.forEach(e=>correos.add(e));}}));
+    return `<div class="contact-result tel-summary">
+      <div class="field"><b style="font-size:15px;">📞 ${esc(t)}</b><span class="badge-star">${keys.length} placa(s)</span><span class="actions" style="margin-left:auto"><a class="btn small" href="tel:${esc(t)}">Llamar</a></span></div>
+      <div class="field"><span class="lbl">Contacto(s)</span>${nombres.size?esc(Array.from(nombres).join(' / ')):'<span style="color:var(--muted)">Sin nombre registrado</span>'}</div>
+      ${correos.size?`<div class="field"><span class="lbl">Correo(s)</span>${Array.from(correos).map(e=>`<a href="mailto:${esc(e)}">${esc(e)}</a>`).join(', ')}</div>`:''}
     </div>`;
   }).join('');
-  cont.innerHTML=html;
 }
 
-// TELÉFONO -> solo las placas que lo tienen asociado (como contacto o en observaciones)
-function buscarPorTelefono(cont,d,recs){
-  const grupos=new Map();
-  recs.forEach(rec=>{
-    const enCol=rec.telsCol.some(t=>t.includes(d));
-    const enObs=rec.telsObs.some(t=>t.includes(d));
-    if(!(enCol||enObs)||!rec.placa)return;
-    const key=alnum(rec.placa)||rec.claves[0];
-    if(!grupos.has(key))grupos.set(key,{placa:rec.placa,cliente:'',qualitas:false,vias:new Set(),fuentes:new Set()});
-    const g=grupos.get(key);
-    if(enCol)g.vias.add('contacto');
-    if(enObs)g.vias.add('observaciones');
-    g.fuentes.add(`${rec.f.archivo.nombre} › ${rec.sh.nombre}`);
-    if(rec.sh.esQualitas){g.qualitas=true;g.placa=rec.placa;if(rec.cliente)g.cliente=rec.cliente;}
-    else if(!g.cliente&&rec.cliente)g.cliente=rec.cliente;
-  });
-  if(!grupos.size){cont.innerHTML='<div class="empty">Ninguna placa tiene asociado ese teléfono.</div>';return;}
-  const lista=Array.from(grupos.values()).sort((a,b)=>(b.qualitas-a.qualitas)||a.placa.localeCompare(b.placa));
-  let html=`<div class="counter">${lista.length} placa(s) con el teléfono ${esc(d)}${lista.length>200?' — mostrando 200':''}</div>`;
-  html+=`<div class="phones">`+lista.slice(0,200).map(g=>
-    `<div class="phone-row${g.qualitas?' is-primary':''}"><span class="phone">${esc(g.placa)}</span>${g.qualitas?'<span class="badge-star">QUALITAS</span>':''}<span class="src">${g.cliente?esc(g.cliente)+' · ':''}${esc(Array.from(g.vias).join(' + '))} · ${esc(Array.from(g.fuentes).join(' · '))}</span></div>`
-  ).join('')+`</div>`;
-  cont.innerHTML=html;
+function tarjetaPlacaHtml(g,telQ){
+  const porTel=state.gestion.porTel||new Map();
+  const porKey=state.gestion.grupoPorKey||new Map();
+  const filas=g.contactos.map(c=>{
+    const otras=c.tel?Array.from(porTel.get(c.tel)||[]).filter(k=>k!==g.key):[];
+    const hit=telQ&&c.tel.includes(telQ);
+    const nombres=Array.from(c.nombres).join(' / ');
+    const correos=Array.from(c.correos);
+    const compartido=otras.length?`<div class="plates-list share-warn">⚠ Número compartido con ${otras.length} placa(s) más: ${otras.slice(0,15).map(k=>esc(porKey.get(k)?.placa||k)).join(', ')}${otras.length>15?'…':''}</div>`:'';
+    return `<div class="phone-row${c.qualitas?' is-primary':''}${hit?' is-hit':''}">
+      ${c.tel?`<span class="phone">📞 ${esc(c.tel)}</span>`:''}
+      ${nombres?`<span class="ct-name">👤 ${esc(nombres)}</span>`:(c.tel?'<span class="src">👤 sin nombre</span>':'')}
+      ${correos.length?`<span class="ct-mail">✉️ ${correos.map(e=>`<a href="mailto:${esc(e)}">${esc(e)}</a>`).join(', ')}</span>`:''}
+      ${c.qualitas?'<span class="badge-star">QUALITAS</span>':''}
+      ${c.tel?`<span class="actions"><a class="btn small" href="tel:${esc(c.tel)}">Llamar</a></span>`:''}
+      <div class="plates-list">${esc(Array.from(c.vias).join(' + '))} · ${esc(Array.from(c.fuentes).join(' · '))}</div>
+      ${compartido}
+    </div>`;
+  }).join('');
+  return `<div class="contact-result">
+    <div class="field"><b style="font-size:15px;">${esc(g.placa)}</b>${g.qualitas?'<span class="badge-star">QUALITAS</span>':''}${g.cliente?`<span class="src" style="color:var(--muted);">${esc(g.cliente)}</span>`:''}</div>
+    ${filas?`<div class="phones">${filas}</div>`:'<div class="field" style="color:var(--muted);">Sin teléfono ni correo asociado.</div>'}
+  </div>`;
 }
 
 /* ============================================================
