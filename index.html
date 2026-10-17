@@ -2363,6 +2363,11 @@ async function renderGestion(){
       reconstruirIndiceDir();
     }catch(e){console.warn('No se pudo leer el directorio guardado:',e);}
   }
+  // La búsqueda cruza con «Seguimiento anomalías»: si esa vista aún no se abrió, carga su base
+  if(!state.seguimiento._cargado&&!state.seguimiento.rows.length){
+    await cargarSeguimientoDesdeDB();
+    segExcluidas=(await leerPref('seg_excluidas',{}))||{};
+  }
   renderListaDirFiles();
   buscarEnDirectorio($('#dirSearchInput')?.value||'');
 }
@@ -2708,6 +2713,16 @@ function renderListaDirFiles(){
   });
 }
 
+// Claves (placa / identificador) de los equipos que hoy son anomalía en «Seguimiento anomalías».
+// null = no hay base de seguimiento cargada (no se filtra).
+function clavesAnomaliaActual(){
+  if(!state.seguimiento.rows.length)return null;
+  const set=new Set();
+  anomaliasActuales().forEach(r=>[r._nombre,r._identificador,r._clave].map(alnum).forEach(a=>{if(a.length>=5)set.add(a);}));
+  return set;
+}
+const grupoEnAnomalia=(g,set)=>!set||set.has(alnum(g.placa))||g.claves.some(c=>set.has(c));
+
 let _dirSearchTimer=null;
 function buscarEnDirectorioDiferido(q){
   clearTimeout(_dirSearchTimer);
@@ -2722,37 +2737,44 @@ function buscarEnDirectorio(q){
   const grupos=state.gestion.grupos||[];
   if(!grupos.length){cont.innerHTML='<div class="empty">Primero carga tus Excel en la pestaña Directorio.</div>';return;}
 
+  const anom=clavesAnomaliaActual();
+  const enAnom=anom?grupos.filter(g=>grupoEnAnomalia(g,anom)):grupos;
+  const keysAnom=new Set(enAnom.map(g=>g.key));
+  const esAnomKey=k=>!anom||keysAnom.has(k);
   const raw=String(q??'').trim();
-  let lista=grupos,telQ='';
+  let lista=enAnom,telQ='';
   if(raw){
     const ql=normKey(raw),qa=alnum(raw);
     let dig=raw.replace(/[\s.\-+()]/g,'');
     const esTel=/^\d+$/.test(dig);
     if(esTel&&dig.length===11&&dig.startsWith('51'))dig=dig.slice(2);
     if(esTel&&dig.length>=3)telQ=dig;
-    lista=grupos.filter(g=>
+    lista=enAnom.filter(g=>
       (qa&&(alnum(g.placa).includes(qa)||g.claves.some(c=>c.includes(qa))))||
       g.txt.includes(ql)||
       (telQ&&g.contactos.some(c=>c.tel.includes(telQ))));
   }
-  if(!lista.length){cont.innerHTML='<div class="empty">Sin resultados para esa búsqueda.</div>';return;}
+  const aviso=anom
+    ?`<div class="counter">⚠ Solo se muestran las placas que hoy figuran en anomalía en «Seguimiento anomalías» (${enAnom.length} de ${grupos.length} del directorio).</div>`
+    :`<div class="counter">Sin base en «Seguimiento anomalías»: se muestran todas las placas del directorio.</div>`;
+  if(!lista.length){cont.innerHTML=aviso+`<div class="empty">${raw?'Sin placas en anomalía para esa búsqueda.':'Ninguna placa del directorio figura hoy en anomalía.'}</div>`;return;}
 
   const LIM=100;
-  let html=resumenTelefonoHtml(telQ);
+  let html=aviso+resumenTelefonoHtml(telQ,esAnomKey);
   html+=`<div class="counter">${raw?`${lista.length} placa(s) encontrada(s)`:`${lista.length} placa(s) en el directorio`}${lista.length>LIM?` — mostrando ${LIM}, escribe para filtrar`:''}</div>`;
-  html+=lista.slice(0,LIM).map(g=>tarjetaPlacaHtml(g,telQ)).join('');
+  html+=lista.slice(0,LIM).map(g=>tarjetaPlacaHtml(g,telQ,esAnomKey)).join('');
   cont.innerHTML=html;
 }
 
 // Si se busca un teléfono completo: quiénes lo usan y en cuántas placas
-function resumenTelefonoHtml(telQ){
+function resumenTelefonoHtml(telQ,incluir=()=>true){
   if(!telQ||telQ.length<6)return '';
   const porTel=state.gestion.porTel||new Map();
   const porKey=state.gestion.grupoPorKey||new Map();
-  const tels=Array.from(porTel.keys()).filter(t=>t.includes(telQ));
+  const tels=Array.from(porTel.keys()).filter(t=>t.includes(telQ)&&Array.from(porTel.get(t)).some(incluir));
   if(!tels.length||tels.length>5)return '';
   return tels.map(t=>{
-    const keys=Array.from(porTel.get(t));
+    const keys=Array.from(porTel.get(t)).filter(incluir);
     const nombres=new Set(),correos=new Set();
     keys.forEach(k=>(porKey.get(k)?.contactos||[]).forEach(c=>{if(c.tel===t){c.nombres.forEach(n=>nombres.add(n));c.correos.forEach(e=>correos.add(e));}}));
     return `<div class="contact-result tel-summary">
@@ -2763,11 +2785,11 @@ function resumenTelefonoHtml(telQ){
   }).join('');
 }
 
-function tarjetaPlacaHtml(g,telQ){
+function tarjetaPlacaHtml(g,telQ,incluir=()=>true){
   const porTel=state.gestion.porTel||new Map();
   const porKey=state.gestion.grupoPorKey||new Map();
   const filas=g.contactos.map(c=>{
-    const otras=c.tel?Array.from(porTel.get(c.tel)||[]).filter(k=>k!==g.key):[];
+    const otras=c.tel?Array.from(porTel.get(c.tel)||[]).filter(k=>k!==g.key&&incluir(k)):[];
     const hit=telQ&&c.tel.includes(telQ);
     const nombres=Array.from(c.nombres).join(' / ');
     const correos=Array.from(c.correos);
